@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic-settings
+httpx
+torch
+ultralytics
+opencv-python
+numpy
+pillow
