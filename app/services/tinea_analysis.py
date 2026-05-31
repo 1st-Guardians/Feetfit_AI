@@ -456,6 +456,22 @@ def render_photo_overlay(
     return overlay
 
 
+def apply_cutout_background(
+    image_bgr: np.ndarray,
+    foot_mask: np.ndarray,
+    background_color: tuple[int, int, int] = (255, 255, 255),
+) -> np.ndarray:
+    mask = (foot_mask > 0).astype(np.float32)
+    if mask.all():
+        return image_bgr
+
+    alpha = cv2.GaussianBlur(mask, (0, 0), sigmaX=1.0, sigmaY=1.0)
+    alpha = np.clip(alpha, 0.0, 1.0)[:, :, None]
+    background = np.full_like(image_bgr, background_color, dtype=np.uint8)
+    cutout = image_bgr.astype(np.float32) * alpha + background.astype(np.float32) * (1.0 - alpha)
+    return cutout.astype(np.uint8)
+
+
 def circle_from_mask(
     mask: np.ndarray,
     prob: np.ndarray,
@@ -835,6 +851,8 @@ class TineaAnalyzer:
             fungal_threshold=self.fungal_threshold,
             inflammation_threshold=self.inflammation_threshold,
         )
+        if settings.photo_cutout_background:
+            photo_overlay = apply_cutout_background(photo_overlay, foot_mask)
         metrics.update(
             {
                 "foot_outline_found": foot_found,
@@ -846,7 +864,11 @@ class TineaAnalyzer:
                 "inflammation_threshold": self.inflammation_threshold,
                 "suspicion_map_source": "photo_overlay_segmentation_mask",
                 "suspicious_area_map_visualization": "circle_suspicion_map_with_evidence_dots",
-                "original_foot_image_visualization": "photo_overlay_fungal_blue_inflammation_red",
+                "original_foot_image_visualization": (
+                    "photo_overlay_fungal_blue_inflammation_red_cutout_background"
+                    if settings.photo_cutout_background
+                    else "photo_overlay_fungal_blue_inflammation_red"
+                ),
                 "max_fungal_prob": float(probs[1].max()),
                 "max_inflammation_prob": float(probs[2].max()),
             }

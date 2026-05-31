@@ -7,7 +7,11 @@ from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.security import bearer_scheme
-from app.schemas.reports import TineaPedisReportRequest
+from app.schemas.reports import HalluxValgusReportRequest, TineaPedisReportRequest
+from app.services.hallux_valgus_analysis import (
+    analyze_hallux_valgus_image,
+    score_analysis_text,
+)
 from app.services.tinea_analysis import AnalysisError, analyze_foot_image, combine_jpeg_images_side_by_side
 
 
@@ -100,6 +104,97 @@ async def create_tinea_pedis_report(
         async with httpx.AsyncClient(timeout=settings.report_proxy_timeout_seconds) as client:
             upstream_response = await client.post(
                 settings.tinea_report_endpoint,
+                headers=headers,
+                data={"request": forwarded_request},
+                files=files,
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Report server request failed: {exc}",
+        ) from exc
+
+    return Response(
+        content=upstream_response.content,
+        status_code=upstream_response.status_code,
+        media_type=upstream_response.headers.get("content-type"),
+    )
+
+
+@router.post(
+    "/hallux-valgus",
+    summary="왼발/오른발 사진 분석 후 무지외반 리포트 저장 요청",
+    description=(
+        "왼발 사진과 오른발 사진을 각각 1장씩 업로드하면 서버 내부 AI가 발 외곽선을 추출하고 "
+        "무지외반 각도(HVA)를 계산합니다. 분석 이미지는 발 외곽선 위에 3개 키포인트와 연결선을 "
+        "표시한 이미지이며, 무좀 리포트와 같은 방식으로 리포트 서버에 multipart 요청을 전달합니다."
+    ),
+    responses={
+        200: {"description": "리포트 서버에서 반환한 응답입니다."},
+        201: {"description": "리포트 서버에서 저장 성공 후 반환한 응답입니다."},
+        400: {"description": "업로드한 이미지가 비어 있습니다."},
+        413: {"description": "업로드한 이미지 용량이 너무 큽니다."},
+        500: {"description": "AI 분석 중 오류가 발생했습니다."},
+        502: {"description": "리포트 서버 요청에 실패했습니다."},
+    },
+)
+async def create_hallux_valgus_report(
+    measurementSessionId: int = Form(1, ge=1, description="측정 세션 ID입니다. 기본값은 1입니다."),
+    leftFootImage: UploadFile = File(..., description="분석할 왼발 원본 사진 1장을 업로드하세요."),
+    rightFootImage: UploadFile = File(..., description="분석할 오른발 원본 사진 1장을 업로드하세요."),
+    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
+) -> Response:
+    left_image_bytes = await read_upload_image(leftFootImage, "leftFootImage")
+    right_image_bytes = await read_upload_image(rightFootImage, "rightFootImage")
+
+    try:
+        left_analysis = await run_in_threadpool(
+            analyze_hallux_valgus_image,
+            left_image_bytes,
+            leftFootImage.filename,
+            "left",
+        )
+        right_analysis = await run_in_threadpool(
+            analyze_hallux_valgus_image,
+            right_image_bytes,
+            rightFootImage.filename,
+            "right",
+        )
+    except AnalysisError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+    report_request = HalluxValgusReportRequest(
+        measurement_session_id=measurementSessionId,
+        left_toe_angle_degree=left_analysis.angle_degree,
+        right_toe_angle_degree=right_analysis.angle_degree,
+        score_analysis_text=score_analysis_text(left_analysis.angle_degree, right_analysis.angle_degree),
+    )
+    forwarded_request = json.dumps(report_request.model_dump(by_alias=True), ensure_ascii=False)
+
+    files = {
+        "leftFootImage": (
+            "hallux_valgus_left.png",
+            left_analysis.analysis_png,
+            "image/png",
+        ),
+        "rightFootImage": (
+            "hallux_valgus_right.png",
+            right_analysis.analysis_png,
+            "image/png",
+        ),
+    }
+    headers = {
+        "accept": "*/*",
+        "Authorization": f"{credentials.scheme} {credentials.credentials}",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=settings.report_proxy_timeout_seconds) as client:
+            upstream_response = await client.post(
+                settings.hallux_valgus_report_endpoint,
                 headers=headers,
                 data={"request": forwarded_request},
                 files=files,

@@ -38,3 +38,12 @@ class TineaPedisReportRequest(BaseModel):
         default=DEFAULT_TOTAL_SCORE_DESCRIPTION,
         alias="totalScoreDescription",
     )
+
+
+class HalluxValgusReportRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    measurement_session_id: int = Field(alias="measurementSessionId", ge=1)
+    left_toe_angle_degree: float = Field(alias="leftToeAngleDegree", ge=0)
+    right_toe_angle_degree: float = Field(alias="rightToeAngleDegree", ge=0)
+    score_analysis_text: str = Field(alias="scoreAnalysisText")

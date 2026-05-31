@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     weights_dir: Path = Field(default=PROJECT_ROOT / "weights")
     sam_source_dir: Path = Field(default=Path(r"D:\tinea pedis\sam\segment-anything"))
     tinea_report_endpoint: str = "http://54.184.58.176/api/reports/tina-pedis"
+    hallux_valgus_report_endpoint: str = "http://54.184.58.176/api/reports/hallux-valgus"
     report_proxy_timeout_seconds: float = 60.0
     max_upload_size_bytes: int = 10 * 1024 * 1024
     combined_image_max_height: int = 1600
@@ -41,6 +42,19 @@ class Settings(BaseSettings):
     max_dot_area_for_suspicion_map: int = 450
     inner_confidence_percentile: float = 78.0
     inner_min_area_ratio: float = 0.18
+    photo_cutout_background: bool = True
+
+    hallux_model_source_dir: Path = Field(default=Path(r"D:\Hallux valgus"))
+    hallux_landmark_weights: Path = Field(
+        default=Path(
+            r"D:\Hallux valgus\runs\real_foot_landmark_swin\teacher_student_top2_angle_from_swin\weights\best_top2_angle.pt"
+        )
+    )
+    hallux_img_size: int = 384
+    hallux_seg_conf: float = 0.25
+    hallux_crop_padding: int = 28
+    hallux_visual_lower_segment_ratio: float = 0.85
+    hallux_visual_lower_segment_foot_ratio: float = 0.24
 
 
 settings = Settings()

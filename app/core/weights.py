@@ -10,6 +10,7 @@ class WeightPaths:
     foot_segmentation: Path = root / "foot_seg_yolo11n_best.pt"
     tinea_pedis_segmentation: Path = root / "tinea_pedis_best.pt"
     sam_checkpoint: Path = root / "sam_vit_b_01ec64.pth"
+    hallux_landmark: Path = settings.hallux_landmark_weights
 
 
 weights = WeightPaths()

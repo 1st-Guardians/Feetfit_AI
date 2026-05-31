@@ -8,3 +8,5 @@ ultralytics
 opencv-python
 numpy
 pillow
+timm
+pyyaml
