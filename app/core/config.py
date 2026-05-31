@@ -14,7 +14,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_name: str = "핏핏 AI 무좀 분석 API"
+    app_name: str = "Feetfit AI 무좀 분석 API"
     app_version: str = "0.1.0"
     weights_dir: Path = Field(default=PROJECT_ROOT / "weights")
     sam_source_dir: Path = Field(default=Path(r"D:\tinea pedis\sam\segment-anything"))
