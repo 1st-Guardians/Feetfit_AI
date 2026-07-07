@@ -8,10 +8,18 @@ from starlette.concurrency import run_in_threadpool
 from app.core.config import settings
 from app.core.security import bearer_scheme
 from app.schemas.reports import HalluxValgusReportRequest, TineaPedisReportRequest
+from app.schemas.shoes import (
+    ShoeRecommendationForwardRequest,
+    ShoeRecommendationItemPayload,
+    ShoeRecommendationReasonPayload,
+    ShoeRecommendationTriggerRequest,
+)
 from app.services.hallux_valgus_analysis import (
     analyze_hallux_valgus_image,
     score_analysis_text,
 )
+from app.services.shoe_db import ShoeDbError
+from app.services.shoe_recommendation import ShoeRecommendationError, compute_shoe_recommendations
 from app.services.tinea_analysis import AnalysisError, analyze_foot_image, combine_jpeg_images_side_by_side
 
 
@@ -198,6 +206,78 @@ async def create_hallux_valgus_report(
                 headers=headers,
                 data={"request": forwarded_request},
                 files=files,
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Report server request failed: {exc}",
+        ) from exc
+
+    return Response(
+        content=upstream_response.content,
+        status_code=upstream_response.status_code,
+        media_type=upstream_response.headers.get("content-type"),
+    )
+
+
+@router.post(
+    "/shoe-recommendations",
+    summary="측정 세션 기준 신발 전체 발 적합도 산출 및 저장 요청",
+    description=(
+        "측정 세션 ID를 받아 그 세션이 속한 사용자의 최신 종합 발 분석(자세 균형, 좌우 압력 분포, "
+        "발볼/발길이 수치, 평균 습도), 무지외반 분석, 무좀 분석 결과를 조회하고, DB에 있는 전체 신발의 "
+        "리뷰와 비교해 신발별 발 적합도(fitScore)를 새로 계산합니다. 저장된 값을 불러오지 않고 매 요청마다 "
+        "다시 계산하며, 계산 결과는 리포트 서버의 신발 적합도 배치 저장 API로 전달됩니다. "
+        "상단 Authorize 버튼에서 Bearer 토큰을 먼저 입력하세요."
+    ),
+    responses={
+        200: {"description": "리포트 서버에서 반환한 응답입니다."},
+        404: {"description": "측정 세션 또는 발 분석 데이터를 찾을 수 없습니다."},
+        500: {"description": "AI 계산 중 오류가 발생했습니다."},
+        502: {"description": "리포트 서버 요청에 실패했습니다."},
+    },
+)
+async def create_shoe_recommendations_report(
+    request: ShoeRecommendationTriggerRequest,
+    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
+) -> Response:
+    try:
+        batch = await run_in_threadpool(compute_shoe_recommendations, request.measurement_session_id)
+    except ShoeRecommendationError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ShoeDbError as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+    forward_request = ShoeRecommendationForwardRequest(
+        measurement_session_id=batch.measurement_session_id,
+        recommendations=[
+            ShoeRecommendationItemPayload(
+                shoe_id=item.shoe_id,
+                fit_score=item.fit_score,
+                reasons=[
+                    ShoeRecommendationReasonPayload(
+                        reason_type=reason.reason_type,
+                        title=reason.title,
+                        risk_level=reason.risk_level,
+                        review_ids=reason.review_ids,
+                    )
+                    for reason in item.reasons
+                ],
+            )
+            for item in batch.items
+        ],
+    )
+    headers = {
+        "accept": "*/*",
+        "Authorization": f"{credentials.scheme} {credentials.credentials}",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=settings.report_proxy_timeout_seconds) as client:
+            upstream_response = await client.post(
+                settings.shoe_recommendation_endpoint,
+                headers=headers,
+                json=forward_request.model_dump(by_alias=True),
             )
     except httpx.HTTPError as exc:
         raise HTTPException(

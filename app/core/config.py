@@ -20,7 +20,27 @@ class Settings(BaseSettings):
     sam_source_dir: Path = Field(default=Path(r"D:\tinea pedis\sam\segment-anything"))
     tinea_report_endpoint: str = "http://54.184.58.176/api/reports/tina-pedis"
     hallux_valgus_report_endpoint: str = "http://54.184.58.176/api/reports/hallux-valgus"
+    shoe_recommendation_endpoint: str = "http://54.184.58.176/api/shoes/recommendations"
+    shoe_summary_save_endpoint_template: str = "http://54.184.58.176/api/shoes/{shoe_id}/summaries"
     report_proxy_timeout_seconds: float = 60.0
+
+    shoe_db_url: str = ""
+    shoe_db_username: str = ""
+    shoe_db_password: str = ""
+
+    shoe_embedding_model_name: str = "BAAI/bge-m3"
+    shoe_embedding_device: str = "auto"
+    shoe_review_embedding_cache_path: Path = Field(default=PROJECT_ROOT / ".cache" / "shoe_review_embeddings.npz")
+    shoe_max_candidate_reviews_per_reason: int = 40
+    shoe_reviews_per_reason: int = 3
+    shoe_risk_low_min_score: float = 70.0
+    shoe_risk_medium_min_score: float = 40.0
+
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen2.5:7b-instruct"
+    ollama_temperature: float = 0.3
+    ollama_request_timeout_seconds: float = 120.0
+
     max_upload_size_bytes: int = 10 * 1024 * 1024
     combined_image_max_height: int = 1600
     combined_image_gap_pixels: int = 16
