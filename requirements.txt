@@ -10,3 +10,8 @@ numpy>=2,<3
 pillow
 timm
 pyyaml
+pymysql
+sentence-transformers
+ollama
+langchain-core
+langchain-ollama
