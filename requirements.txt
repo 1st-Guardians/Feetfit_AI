@@ -4,9 +4,9 @@ python-multipart
 pydantic-settings
 httpx
 torch
-ultralytics
-opencv-python
-numpy
+ultralytics>=8.4,<9
+opencv-python>=4.13,<5
+numpy>=2,<3
 pillow
 timm
 pyyaml

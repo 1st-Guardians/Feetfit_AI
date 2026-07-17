@@ -12,7 +12,12 @@ import torch
 
 from app.core.config import PROJECT_ROOT, settings
 from app.core.weights import weights
-from app.services.tinea_analysis import AnalysisError, load_image, predict_foot_mask
+from app.services.tinea_analysis import (
+    AnalysisError,
+    load_image,
+    predict_foot_mask,
+    validate_precomputed_foot_mask,
+)
 
 
 os.environ.setdefault("YOLO_CONFIG_DIR", str(PROJECT_ROOT / ".ultralytics"))
@@ -55,6 +60,17 @@ def resolve_device(device_arg: str) -> str:
     return device_arg
 
 
+def install_numpy_pickle_compat() -> None:
+    # Some checkpoints were saved with NumPy 2.x, where pickle paths use numpy._core.
+    # The server environment may run NumPy 1.x, which exposes the same objects under numpy.core.
+    if "numpy._core" not in sys.modules and hasattr(np, "core"):
+        sys.modules["numpy._core"] = np.core
+    if "numpy._core.multiarray" not in sys.modules and hasattr(np.core, "multiarray"):
+        sys.modules["numpy._core.multiarray"] = np.core.multiarray
+    if "numpy._core.numeric" not in sys.modules and hasattr(np.core, "numeric"):
+        sys.modules["numpy._core.numeric"] = np.core.numeric
+
+
 def load_hallux_model(weights_path: Path, device: str) -> torch.nn.Module:
     if not weights_path.exists():
         raise AnalysisError(f"Hallux landmark weights not found: {weights_path}")
@@ -71,6 +87,7 @@ def load_hallux_model(weights_path: Path, device: str) -> torch.nn.Module:
         coord_window_radius=6,
         coord_mode="softargmax",
     ).to(device)
+    install_numpy_pickle_compat()
     try:
         checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
     except TypeError:
@@ -228,21 +245,20 @@ def render_analysis_image(mask: np.ndarray, points: np.ndarray) -> bytes:
 
 def angle_stage(angle: float) -> str:
     if angle < 15.0:
-        return "정상 또는 변형이 뚜렷하지 않은 범위(15° 미만)"
+        return "normal or low visible-deviation range (<15 deg)"
     if angle < 20.0:
-        return "경미한 변형 범위(15~20°)"
+        return "mild visible-deviation range (15-20 deg)"
     if angle < 40.0:
-        return "변형이 진행된 범위(20~40°)"
-    return "심한 변형 범위(40° 이상)"
+        return "moderate visible-deviation range (20-40 deg)"
+    return "severe visible-deviation range (>=40 deg)"
 
 
 def side_analysis_text(foot_side: str, angle: float) -> str:
-    side_label = "왼발" if foot_side == "left" else "오른발"
+    side_label = "left foot" if foot_side == "left" else "right foot"
     return (
-        f"{side_label} 엄지발가락이 두 번째 발가락 쪽으로 기울어진 각도(HVA)가 "
-        f"{angle:.1f}°로 측정되었습니다. {angle_stage(angle)}에 해당합니다."
+        f"The {side_label} visible toe alignment angle was measured as "
+        f"{angle:.1f} degrees. This is in the {angle_stage(angle)}."
     )
-
 
 def risk_score_from_angles(left_angle: float, right_angle: float) -> float:
     max_angle = max(left_angle, right_angle)
@@ -264,34 +280,75 @@ def score_analysis_text(left_angle: float, right_angle: float) -> str:
     left_abnormal = left_angle >= 15.0
     right_abnormal = right_angle >= 15.0
     if left_abnormal and right_abnormal:
-        return "양쪽 발 모두 무지외반 진행 가능성이 있어 관리가 필요합니다."
+        if left_angle >= right_angle:
+            return (
+                "양발 모두 무지외반 진행 가능성이 있으며, 특히 왼발의 "
+                f"각도가 {left_angle:.1f}도로 더 높아 관리가 필요합니다."
+            )
+        return (
+            "양발 모두 무지외반 진행 가능성이 있으며, 특히 오른발의 "
+            f"각도가 {right_angle:.1f}도로 더 높아 관리가 필요합니다."
+        )
     if left_abnormal:
-        return "왼발 중심으로 무지외반 진행 가능성이 있어 관리가 필요합니다."
+        return (
+            f"왼발의 무지외반 각도가 {left_angle:.1f}도로 관찰되어 "
+            "주의와 관리가 필요합니다."
+        )
     if right_abnormal:
-        return "오른발 중심으로 무지외반 진행 가능성이 있어 관리가 필요합니다."
-    return "현재 이미지 기준으로는 무지외반 위험 신호가 크게 두드러지지 않습니다."
+        return (
+            f"오른발의 무지외반 각도가 {right_angle:.1f}도로 관찰되어 "
+            "주의와 관리가 필요합니다."
+        )
+    return "양발의 무지외반 각도가 정상 범위로 보여 현재 큰 위험 신호는 두드러지지 않습니다."
 
 
 class HalluxValgusAnalyzer:
     def __init__(self) -> None:
         self.device = resolve_device(settings.analysis_device)
         self.model = load_hallux_model(weights.hallux_landmark, self.device)
-        if not weights.foot_segmentation.exists():
-            raise AnalysisError(f"Foot segmentation model not found: {weights.foot_segmentation}")
-        from ultralytics import YOLO
+        self.foot_model = None
+        self._foot_model_lock = threading.Lock()
 
-        self.foot_model = YOLO(str(weights.foot_segmentation))
+    def get_foot_model(self):
+        if self.foot_model is not None:
+            return self.foot_model
+        with self._foot_model_lock:
+            if self.foot_model is None:
+                if not weights.foot_segmentation.exists():
+                    raise AnalysisError(
+                        f"Foot segmentation model not found: {weights.foot_segmentation}"
+                    )
+                from ultralytics import YOLO
 
-    def analyze(self, image_bytes: bytes, filename: str | None, foot_side: str) -> HalluxValgusAnalysisResult:
+                self.foot_model = YOLO(str(weights.foot_segmentation))
+        return self.foot_model
+
+    def analyze(
+        self,
+        image_bytes: bytes,
+        filename: str | None,
+        foot_side: str,
+        *,
+        foot_mask: np.ndarray | None = None,
+    ) -> HalluxValgusAnalysisResult:
         _, image_bgr = load_image(image_bytes)
-        foot_mask, foot_found = predict_foot_mask(
-            foot_model=self.foot_model,
-            image_bgr=image_bgr,
-            conf=settings.hallux_seg_conf,
-            min_component_area=settings.foot_min_component_area,
-            iou_dup_threshold=settings.foot_iou_duplicate_threshold,
-        )
-        crop_bgr, crop_mask, bbox = crop_foot(image_bgr, foot_mask)
+        if foot_mask is None:
+            analyzed_foot_mask, foot_found = predict_foot_mask(
+                foot_model=self.get_foot_model(),
+                image_bgr=image_bgr,
+                conf=settings.hallux_seg_conf,
+                min_component_area=settings.foot_min_component_area,
+                iou_dup_threshold=settings.foot_iou_duplicate_threshold,
+            )
+            mask_source = "hallux_yolo"
+        else:
+            analyzed_foot_mask = validate_precomputed_foot_mask(
+                foot_mask,
+                image_bgr.shape[:2],
+            )
+            foot_found = True
+            mask_source = "shared_aruco_segmentation"
+        crop_bgr, crop_mask, bbox = crop_foot(image_bgr, analyzed_foot_mask)
         coords_crop, score, side_mode, flip_for_model = predict_crop(
             self.model,
             crop_bgr,
@@ -312,6 +369,7 @@ class HalluxValgusAnalyzer:
             score=score,
             metrics={
                 "foot_outline_found": bool(foot_found),
+                "foot_mask_source": mask_source,
                 "bbox": bbox,
                 "score": score,
                 "side_mode": side_mode,
@@ -339,8 +397,19 @@ def get_hallux_valgus_analyzer() -> HalluxValgusAnalyzer:
     return _hallux_analyzer
 
 
-def analyze_hallux_valgus_image(image_bytes: bytes, filename: str | None, foot_side: str) -> HalluxValgusAnalysisResult:
+def analyze_hallux_valgus_image(
+    image_bytes: bytes,
+    filename: str | None,
+    foot_side: str,
+    *,
+    foot_mask: np.ndarray | None = None,
+) -> HalluxValgusAnalysisResult:
     if foot_side not in {"left", "right"}:
         raise AnalysisError(f"Unsupported foot side: {foot_side}")
     analyzer = get_hallux_valgus_analyzer()
-    return analyzer.analyze(image_bytes, filename, foot_side)
+    return analyzer.analyze(
+        image_bytes,
+        filename,
+        foot_side,
+        foot_mask=foot_mask,
+    )

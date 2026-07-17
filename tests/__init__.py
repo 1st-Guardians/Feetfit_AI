@@ -1,0 +1,1 @@
+"""Feetfit AI test package."""
