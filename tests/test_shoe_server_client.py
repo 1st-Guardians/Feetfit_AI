@@ -28,7 +28,9 @@ class _TestPayload(BaseModel):
     marker: str
 
 
-def _foot_state(*, balance_score: float = 82.0) -> dict:
+def _foot_state(
+    *, balance_score: float = 82.0, type_text: str | None = "균형형"
+) -> dict:
     return {
         "dailyFootAnalysis": {
             "balanceScore": balance_score,
@@ -40,7 +42,7 @@ def _foot_state(*, balance_score: float = 82.0) -> dict:
             "rightFootWidthMm": 103.1,
             "avgTemperatureCelsius": 31.2,
             "avgHumidityPercent": 54.0,
-            "typeText": "균형형",
+            "typeText": type_text,
         },
         "tinaPedisAnalysis": {
             "fungalSuspicionSafetyScore": 91,
@@ -143,12 +145,17 @@ def _shoe(shoe_id: int) -> dict:
     }
 
 
-def _context_page(page: int, *, balance_score: float = 82.0) -> dict:
+def _context_page(
+    page: int,
+    *,
+    balance_score: float = 82.0,
+    type_text: str | None = "균형형",
+) -> dict:
     return {
         "measurementSessionId": 30,
         "userId": 7,
         "measurementStatus": "COMPLETED",
-        "footState": _foot_state(balance_score=balance_score),
+        "footState": _foot_state(balance_score=balance_score, type_text=type_text),
         "shoes": [_shoe(101 + page)],
         "currentPage": page,
         "totalPages": 2,
@@ -270,6 +277,31 @@ class ShoeServerClientTests(unittest.IsolatedAsyncioTestCase):
             )
             with self.assertRaisesRegex(ShoeServerClientError, "changed session metadata"):
                 await client.fetch_recommendation_context(30)
+
+    async def test_allows_display_type_text_to_change_between_context_pages(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            page = int(request.url.params["page"])
+            result = _context_page(
+                page,
+                type_text=(
+                    None
+                    if page == 0
+                    else "발의 아치가 낮아 발바닥이 넓게 닿는 편이에요."
+                ),
+            )
+            return httpx.Response(200, json=_api_response(result), request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = ShoeServerClient(
+                "Bearer token", internal_api_key="test-internal-key", http_client=http_client
+            )
+            context = await client.fetch_recommendation_context(30)
+
+        self.assertEqual([shoe.id for shoe in context.shoes], [101, 102])
+        daily_foot_analysis = context.foot_state.daily_foot_analysis
+        self.assertIsNotNone(daily_foot_analysis)
+        assert daily_foot_analysis is not None
+        self.assertIsNone(daily_foot_analysis.type_text)
 
     async def test_rejects_page_that_claims_to_end_before_total_pages(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:

@@ -13,6 +13,7 @@ from app.schemas.shoe_server import (
     ServerRecommendationContextPage,
     ServerSavedRecommendation,
     ServerShoeCharacteristics,
+    ServerUserFootState,
 )
 
 
@@ -27,6 +28,21 @@ class ShoeServerClientError(RuntimeError):
 
 class ShoeServerConfigurationError(ShoeServerClientError):
     """Feetfit_AI의 로컬 Server 연동 설정이 유효하지 않을 때 발생한다."""
+
+
+def _recommendation_foot_state_snapshot(foot_state: ServerUserFootState) -> dict[str, Any]:
+    """Return the session facts whose stability matters to recommendation scoring.
+
+    ``dailyFootAnalysis.typeText`` is presentation copy generated and saved by a
+    separate AI workflow. Recommendation scoring never consumes it, so a
+    concurrent type-text save must not invalidate an otherwise stable paged
+    context. Every other foot-state field remains part of the consistency
+    snapshot.
+    """
+
+    return foot_state.model_dump(
+        exclude={"daily_foot_analysis": {"type_text"}},
+    )
 
 
 class ShoeServerClient:
@@ -185,7 +201,8 @@ class ShoeServerClient:
         if (
             result.user_id != first_page.user_id
             or result.measurement_status != first_page.measurement_status
-            or result.foot_state != first_page.foot_state
+            or _recommendation_foot_state_snapshot(result.foot_state)
+            != _recommendation_foot_state_snapshot(first_page.foot_state)
             or result.total_pages != first_page.total_pages
             or result.total_elements != first_page.total_elements
         ):

@@ -201,6 +201,24 @@ def _embedding_patches():
 
 
 class ShoeRecommendationContextTests(unittest.TestCase):
+    def test_type_text_is_not_a_scoring_or_review_shortlist_input(self) -> None:
+        before_raw = _context_dict()
+        after_raw = copy.deepcopy(before_raw)
+        after_raw["footState"]["dailyFootAnalysis"]["typeText"] = (
+            "발의 아치가 낮아 발바닥이 넓게 닿는 편이에요."
+        )
+        before = ServerRecommendationContext.model_validate(before_raw)
+        after = ServerRecommendationContext.model_validate(after_raw)
+
+        before_areas = score_shoe_fit(before.shoes[0], before.foot_state)
+        after_areas = score_shoe_fit(after.shoes[0], after.foot_state)
+
+        self.assertEqual(before_areas, after_areas)
+        self.assertEqual(
+            derive_foot_need(before.foot_state),
+            derive_foot_need(after.foot_state),
+        )
+
     def test_quantitative_scoring_uses_runrepeat_and_keeps_three_areas(self) -> None:
         with _embedding_patches()[0], _embedding_patches()[1], _embedding_patches()[2]:
             batch = compute_shoe_recommendations(_context())
