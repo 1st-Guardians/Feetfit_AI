@@ -6,6 +6,11 @@ __pycache__/
 .ruff_cache/
 .cache/
 .ultralytics/
+.claude/
+.codex/
+.agents/
+.idea/
+.vscode/
 .venv/
 venv/
 .env
@@ -20,3 +25,7 @@ models/
 
 storage/uploads/
 storage/generated/
+storage/debug_*
+
+# Local execution/audit reports can contain user, session, device, and DB metadata.
+artifacts/

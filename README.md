@@ -23,16 +23,18 @@ app/
   schemas/
     reports.py                  Tinea pedis / hallux valgus request schemas
     shoes.py                    Shoe recommendation batch request/forward schemas
+    shoe_server.py              Feetfit_Server internal read contract schemas
     shoe_fit_comment.py         Ollama-generated summary response schema
   services/
     tinea_analysis.py           Foot/tinea segmentation, scoring, suspicion map render
     hallux_valgus_analysis.py   Foot outline extraction, hallux valgus angle (HVA) scoring
-    shoe_db.py                  Direct MySQL access (shared with Feetfit_Server) for
-                                 shoes/reviews/foot analysis/saved recommendations
+    shoe_db.py                  Legacy direct-DB adapter (not used by HTTP routes)
+    shoe_server_client.py       Forwarded-JWT Feetfit_Server context/callback client
     shoe_embedding.py           BGE-M3 sentence embedding + disk cache + cosine ranking
-    shoe_feature_rules.py       Foot-need thresholds, review keyword/polarity rules
-    shoe_recommendation.py      fitScore/riskLevel/근거 리뷰 계산 (배치, LLM 미사용)
-    shoe_fit_comment_service.py Ollama call: pointSummary + 부위별 reviewSummary 생성
+    shoe_feature_rules.py       Session foot-need text used by semantic review search
+    shoe_fit_policy.py          RunRepeat quantitative TEMPORARY_HEURISTIC policy
+    shoe_recommendation.py      전체 신발 fitScore/riskLevel + BGE-M3 후보 계산
+    shoe_fit_comment_service.py Ollama 후보 subset 검증 + point/review summaries
 weights/                        Model weights, ignored by git
 ```
 
@@ -110,9 +112,11 @@ D:/Feetfit_AI/weights/sam_vit_b_01ec64.pth
 
 The shoe-recommendation endpoints additionally require:
 
-- A MySQL connection to the **same database Feetfit_Server uses** (`SHOE_DB_URL` /
-  `SHOE_DB_USERNAME` / `SHOE_DB_PASSWORD`) — shoes, reviews, foot analysis results,
-  and saved shoe recommendations are all read/written there directly.
+- Feetfit_Server's internal shoe-analysis endpoints. The incoming user Bearer token
+  is forwarded unchanged together with `X-Internal-Api-Key`. Configure
+  `FEETFIT_SERVER_INTERNAL_API_KEY` to the same service key as Feetfit_Server;
+  missing or blank keys fail before any request is sent. The shared DB is not used
+  as a fallback when an internal API request fails.
 - [Ollama](https://ollama.com) running locally with a pulled model:
 
   ```powershell
@@ -217,28 +221,100 @@ curl -X POST "http://localhost:8000/api/reports/hallux-valgus" \
   -F "rightFootImage=@right-foot.jpeg;type=image/jpeg"
 ```
 
+### `POST /api/reports/foot-type-text`
+
+Feetfit_Server의 measurement session이 `COMPLETED`로 commit된 뒤 Server가
+해당 세션의 DB 분석 결과를 다시 읽어 자동으로 호출하는 내부 전용
+endpoint입니다. 클라이언트가 `typeText`나 `careTips`를 작성하여 보내지
+않습니다. Server는 exact-session facts와 해당 facts의 SHA-256
+`factsHash`를 함께 전달합니다.
+
+```json
+{
+  "measurementSessionId": 30,
+  "measurementStatus": "COMPLETED",
+  "factsHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "analysis": {
+    "archType": "LOW",
+    "footWidthType": "WIDE",
+    "pressureBalanceType": "BALANCED",
+    "measuredLeftFootSizeMm": 253.0,
+    "measuredRightFootSizeMm": 251.0,
+    "leftFootWidthMm": 101.0,
+    "rightFootWidthMm": 100.0,
+    "leftPressurePercent": 49.0,
+    "rightPressurePercent": 51.0,
+    "plantarFootprintAnalysisText": "발바닥 중앙부와 뒤꿈치의 압력 분포 차이가 관찰됩니다."
+  }
+}
+```
+
+GPT는 `ARCH`, `WIDTH`, `PRESSURE_BALANCE`의 명시적 분류 중 신발 선택에
+가장 유용한 evidence ID만 고릅니다. 최종 한국어는 해당 evidence에 고정된
+검증 문구로 렌더링되므로 GPT가 평발이나 발볼 특성을 새로 추측할 수
+없습니다. OpenAI 호출이 실패하거나 잘못된 ID를 반환하면 `ARCH → WIDTH →
+PRESSURE_BALANCE` 순서의 로컬 fallback을 사용합니다. 원시 발 길이와 너비는
+추적용일 뿐, 그 숫자만으로 아치나 발볼 유형을 분류하지 않습니다.
+OpenAI에는 원시 측정값이 아닌 검증된 candidate evidence만 전달하며,
+최종 문구는 `"이번 측정에서는"`으로 시작하지 않도록 응답 계약에서도
+검증합니다.
+
+AI는 DB를 수정하지 않고 다음 pure-generation 응답만 반환합니다.
+
+```json
+{
+  "measurementSessionId": 30,
+  "factsHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "typeText": "발의 아치가 낮아 발바닥이 넓게 닿는 편이에요. 오래 걷거나 서 있으면 피로가 커질 수 있어 아치를 잘 받쳐주는 신발이 더 편안할 수 있어요.",
+  "evidenceId": "ARCH_LOW",
+  "source": "OPENAI"
+}
+```
+
+Server는 응답의 `measurementSessionId`와 `factsHash`를 현재 DB facts와 다시
+검증하고, 동일 완료 세션의 `typeText`가 아직 없을 때만 `typeText`를
+저장합니다. `careTips`는 읽거나 덮어쓰지 않습니다. 이후 신발 목록은
+Server의 `GET /api/reports/foot-type-text`로 저장된 문구를 조회합니다.
+
+```bash
+# 정상 사용 시 Server가 자동 호출하며, 아래는 로컬 내부-계약 점검용 예시입니다.
+curl -X POST "http://localhost:8000/api/reports/foot-type-text" \
+  -H "Authorization: Bearer <SERVER_MINTED_TOKEN>" \
+  -H "X-Internal-Api-Key: <FEETFIT_SERVER_INTERNAL_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"measurementSessionId":30,"measurementStatus":"COMPLETED","factsHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","analysis":{"archType":"LOW"}}'
+```
+
 ### `POST /api/reports/shoe-recommendations`
 
 ```json
 { "measurementSessionId": 30 }
 ```
 
-Resolves the user behind that measurement session, reads their latest 종합 발
-분석(자세 균형, 좌우 압력 분포, 발볼/발길이 수치, 평균 습도)/무지외반/무좀 분석
-결과, then recomputes **fitScore + riskLevel + 근거 리뷰(FOREFOOT/HEEL/INSOLE)**
-for every shoe in the DB from scratch every time it's called (nothing is read from
-a cache). Review evidence is selected with BGE-M3 sentence embeddings (cosine
-similarity against a need sentence built from the foot-state thresholds), one
-sentence per review, up to 3 distinct reviews per body part.
+Uses the forwarded Bearer token to page through Feetfit_Server's internal
+recommendation-context endpoint. The response is fixed to the requested completed
+measurement session and contains its foot analyses, MUSINSA-only reviews, and raw
+RunRepeat lab measurements. The Phase-D scorer computes **fitScore + riskLevel
+(FOREFOOT/HEEL/INSOLE)** from the relationship between the one requested session's
+foot measurements and each shoe's real RunRepeat metrics. Review sentiment never
+changes score or risk. Missing characteristics are not synthesized; present
+components are reweighted, and a body area with zero real components fails closed.
+Every catalog shoe is returned, including shoes with zero reviews (`reviewIds: []`).
+BGE-M3 selects at most three shoe-local MUSINSA candidates per body part.
 
-**No LLM call happens here** — `pointSummary`/`reviewSummary` are intentionally
-left out of the forwarded payload (see `shoe-summaries` below for why) so this
-stays fast (~20s for ~180 shoes). Forwards the result to
-`SHOE_RECOMMENDATION_ENDPOINT`.
+The numerical policy and semantic threshold are explicitly
+`TEMPORARY_HEURISTIC` / `NOT_CLINICALLY_VALIDATED`; weights, allowances and risk/
+pressure/humidity thresholds are environment-backed settings rather than clinical
+claims. The shoe comparison feature is intentionally out of scope.
+
+**No LLM call happens here.** The first-stage save explicitly sends
+`pointSummary: null` and `reviewSummary: null`; null means summary generation is
+pending. The result is forwarded to `FEETFIT_SERVER_RECOMMENDATION_ENDPOINT`.
 
 ```bash
 curl -X POST "http://localhost:8000/api/reports/shoe-recommendations" \
   -H "Authorization: Bearer <TOKEN>" \
+  -H "X-Internal-Api-Key: <FEETFIT_SERVER_INTERNAL_API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{"measurementSessionId": 30}'
 ```
@@ -246,34 +322,44 @@ curl -X POST "http://localhost:8000/api/reports/shoe-recommendations" \
 ### `POST /api/shoes/summaries`
 
 ```json
-{ "shoeId": 220, "userId": 3 }
+{ "shoeId": 220, "measurementSessionId": 30 }
 ```
 
-Called by Feetfit_Server (fire-and-forget) when a shoe detail view finds
-`pointSummary == null`. Returns `202` immediately; generation happens in a
-background task:
+Must be called by Feetfit_Server (fire-and-forget) when a shoe detail view finds
+`pointSummary == null`; this AI endpoint cannot initiate that hook itself. It
+returns `202` immediately and generation happens in a background task:
 
 1. Read the **already-computed** fitScore/riskLevel/title and evidence review
-   texts for that (`userId`, `shoeId`) straight out of the DB — nothing is
-   recalculated (no embeddings, no foot-state lookup).
-2. Call Ollama once (`OLLAMA_MODEL`, temperature `OLLAMA_TEMPERATURE`) to turn
-   that into natural Korean `pointSummary` + `forefootSummary`/`heelSummary`/
-   `insoleSummary`. The prompt explicitly forbids inventing review content for
+   texts from Feetfit_Server's JWT-scoped summary-context endpoint. Nothing is
+   recalculated (no embeddings and no foot-state lookup). The exact completed
+   `measurementSessionId` is required; no current/older-session fallback is used.
+2. Call Ollama once (`OLLAMA_MODEL`, temperature `OLLAMA_TEMPERATURE`) to
+   semantically remove unrelated BGE candidates (the returned IDs must be a unique
+   subset of the exact shoe/reason candidates, maximum three), and turn the facts
+   into Korean `pointSummary` + `forefootSummary`/`heelSummary`/`insoleSummary`.
+   The prompt explicitly forbids inventing review content for
    body parts with zero evidence reviews, forbids medical-diagnosis language,
    and must not contradict the given riskLevel. Response is parsed as JSON with
    a regex-extraction fallback if the model wraps it in prose/markdown.
 3. `POST` the generated summary to `{shoe_id}/summaries` on Feetfit_Server
-   (`SHOE_SUMMARY_SAVE_ENDPOINT_TEMPLATE`), forwarding the same Bearer token.
+   (`FEETFIT_SERVER_SUMMARY_SAVE_ENDPOINT_TEMPLATE`), forwarding the same Bearer
+   token, exact measurementSessionId, summaries, and the validated final reviewIds.
 
-Any failure (missing DB row, Ollama error, save callback failure) is logged and
-silently dropped — Feetfit_Server will simply retry on the next detail view
-since `pointSummary` stays `null`.
+Before generation, the AI also reads `GET /api/shoes/{shoe_id}/characteristics`
+through `FEETFIT_SERVER_CHARACTERISTICS_ENDPOINT_TEMPLATE`. The returned RunRepeat
+levels remain separate from subjective review evidence (for example cushioning,
+shock absorption, and sole thickness are never treated as interchangeable).
+
+Any failure (missing Server context, Ollama error, save callback failure) is logged and
+silently dropped. Once the Server detail-view hook is installed, the next detail
+view can retry because `pointSummary` stays `null`.
 
 ```bash
 curl -X POST "http://localhost:8000/api/shoes/summaries" \
   -H "Authorization: Bearer <TOKEN>" \
+  -H "X-Internal-Api-Key: <FEETFIT_SERVER_INTERNAL_API_KEY>" \
   -H "Content-Type: application/json" \
-  -d '{"shoeId": 220, "userId": 3}'
+  -d '{"shoeId": 220, "measurementSessionId": 30}'
 ```
 
 ## `.env` reference
@@ -281,15 +367,24 @@ curl -X POST "http://localhost:8000/api/shoes/summaries" \
 ```text
 TINEA_REPORT_ENDPOINT=http://35.94.253.151/api/reports/tina-pedis
 HALLUX_VALGUS_REPORT_ENDPOINT=http://35.94.253.151/api/reports/hallux-valgus
-SHOE_RECOMMENDATION_ENDPOINT=http://54.184.58.176/api/shoes/recommendations
-SHOE_SUMMARY_SAVE_ENDPOINT_TEMPLATE=http://54.184.58.176/api/shoes/{shoe_id}/summaries
+FEETFIT_SERVER_RECOMMENDATION_ENDPOINT=http://127.0.0.1:8080/api/shoes/recommendations
+FEETFIT_SERVER_SUMMARY_SAVE_ENDPOINT_TEMPLATE=http://127.0.0.1:8080/api/shoes/{shoe_id}/summaries
+FEETFIT_SERVER_RECOMMENDATION_CONTEXT_ENDPOINT=http://127.0.0.1:8080/api/internal/shoe-analysis/recommendation-context
+FEETFIT_SERVER_SUMMARY_CONTEXT_ENDPOINT_TEMPLATE=http://127.0.0.1:8080/api/internal/shoe-analysis/shoes/{shoe_id}/recommendation-summary-context
+FEETFIT_SERVER_CHARACTERISTICS_ENDPOINT_TEMPLATE=http://127.0.0.1:8080/api/shoes/{shoe_id}/characteristics
+SHOE_RECOMMENDATION_CONTEXT_PAGE_SIZE=100  # 1..200 (Feetfit_Server contract)
+FEETFIT_SERVER_INTERNAL_API_KEY=<same-service-key-configured-on-Feetfit_Server>  # preferred
+INTERNAL_API_KEY=<same-value>  # accepted shared-name fallback
 REPORT_PROXY_TIMEOUT_SECONDS=60
+FEETFIT_SERVER_CALLBACK_TIMEOUT_SECONDS=900  # callback floor; must be >= 900
 
 # OpenAI report text generation
 OPENAI_API_KEY=paste-your-openai-api-key-here
 OPENAI_REPORT_MODEL=gpt-4.1-mini
 OPENAI_REPORT_TIMEOUT_SECONDS=20
 OPENAI_REPORT_TEXT_ENABLED=true
+OPENAI_FOOT_TYPE_TEXT_ENABLED=true
+FOOT_TYPE_PRESSURE_BALANCE_TOLERANCE_PERCENT=5
 OPENAI_REPORT_INCLUDE_IMAGES=true
 
 # Tinea analysis and visualization
@@ -322,20 +417,24 @@ ARUCO_MARKER_COLUMN_SPACING_MM=140
 ARUCO_FIXED_OFFSET_MM=113
 ARUCO_IMAGE_LEFT_ANATOMICAL_SIDE=left
 
-# shared MySQL DB (same instance/schema Feetfit_Server uses)
-SHOE_DB_URL=jdbc:mysql://<host>:3306/feetfit?serverTimezone=Asia/Seoul&characterEncoding=UTF-8&useSSL=false&allowPublicKeyRetrieval=true
-SHOE_DB_USERNAME=feetfit
-SHOE_DB_PASSWORD=<password>
-
 # BGE-M3 sentence embedding (shoe-recommendations batch)
 SHOE_EMBEDDING_DEVICE=auto        # auto | cpu | cuda
 SHOE_MAX_CANDIDATE_REVIEWS_PER_REASON=40
-SHOE_REVIEWS_PER_REASON=3
-SHOE_RISK_LOW_MIN_SCORE=70
-SHOE_RISK_MEDIUM_MIN_SCORE=40
+SHOE_REVIEWS_PER_REASON=3                  # 1..3 (save payload contract)
+SHOE_REVIEW_SEMANTIC_MIN_SCORE=0.42        # TEMPORARY_HEURISTIC
+SHOE_RELEASE_EMBEDDING_MODEL_AFTER_BATCH=true
+SHOE_RISK_LOW_MIN_SCORE=75
+SHOE_RISK_MEDIUM_MIN_SCORE=50
 
 # Ollama (shoe-summaries on-demand generation)
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=qwen2.5:7b-instruct
-OLLAMA_TEMPERATURE=0.3
+OLLAMA_TEMPERATURE=0.0
+OLLAMA_NUM_GPU=-1                 # GPU preferred; 0 forces CPU
+OLLAMA_CPU_FALLBACK_ENABLED=true
 ```
+
+All `FEETFIT_SERVER_*_ENDPOINT*` values must be set to the intended deployment
+environment. Defaults are loopback-only and never point at a public Server. The
+internal API key is mandatory: a blank `FEETFIT_SERVER_INTERNAL_API_KEY` fails
+before any Server request and is never logged.

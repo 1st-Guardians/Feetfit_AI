@@ -10,8 +10,13 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
-from app.core.security import bearer_scheme
-from app.schemas.reports import HalluxValgusReportRequest, TineaPedisReportRequest
+from app.core.security import bearer_scheme, require_internal_api_key
+from app.schemas.reports import (
+    FootTypeTextGenerationRequest,
+    FootTypeTextGenerationResponse,
+    HalluxValgusReportRequest,
+    TineaPedisReportRequest,
+)
 from app.schemas.shoes import (
     ShoeRecommendationForwardRequest,
     ShoeRecommendationItemPayload,
@@ -27,11 +32,20 @@ from app.services.integrated_foot_analysis import (
     analyze_integrated_foot_photo,
 )
 from app.services.report_text_generation import (
+    generate_foot_type_text,
     generate_hallux_score_analysis_text,
     generate_tinea_report_text,
 )
-from app.services.shoe_db import ShoeDbError
-from app.services.shoe_recommendation import ShoeRecommendationError, compute_shoe_recommendations
+from app.services.shoe.shoe_recommendation import (
+    ShoeRecommendationBusyError,
+    ShoeRecommendationError,
+    compute_shoe_recommendations,
+)
+from app.services.shoe.shoe_server_client import (
+    ShoeServerClient,
+    ShoeServerClientError,
+    ShoeServerConfigurationError,
+)
 from app.services.tinea_analysis import AnalysisError, analyze_foot_image, combine_png_images_side_by_side
 
 
@@ -541,18 +555,53 @@ async def create_integrated_foot_report(
 
 
 @router.post(
+    "/foot-type-text",
+    response_model=FootTypeTextGenerationResponse,
+    summary="완료된 발 분석 결과로 신발 목록용 발 타입 문구 생성",
+    description=(
+        "Feetfit_Server가 완료된 정확한 측정 세션의 분석값을 내부 인증으로 전달하면 "
+        "GPT가 신발 선택에 가장 유용한 근거를 고릅니다. 최종 문구는 검증된 근거별 한국어 문장으로 "
+        "생성해 반환합니다. DB 저장은 Feetfit_Server가 같은 세션을 다시 검증한 뒤 직접 수행하며, "
+        "원시 길이/너비만으로 아치나 발볼 유형을 추정하지 않습니다."
+    ),
+    responses={
+        200: {"description": "근거가 검증된 발 타입 문구를 생성했습니다."},
+        403: {"description": "내부 API 키가 없거나 일치하지 않습니다."},
+        422: {"description": "완료 세션 또는 분류된 발 분석 근거가 없습니다."},
+    },
+)
+async def create_foot_type_text_report(
+    request: FootTypeTextGenerationRequest,
+    credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
+    _internal_api_key: None = Security(require_internal_api_key),
+) -> FootTypeTextGenerationResponse:
+    report_text = await generate_foot_type_text(request.analysis)
+    return FootTypeTextGenerationResponse(
+        measurement_session_id=request.measurement_session_id,
+        facts_hash=request.facts_hash,
+        type_text=report_text.type_text,
+        evidence_id=report_text.evidence_id,
+        source=report_text.source,
+    )
+
+
+@router.post(
     "/shoe-recommendations",
     summary="측정 세션 기준 신발 전체 발 적합도 산출 및 저장 요청",
     description=(
-        "측정 세션 ID를 받아 그 세션이 속한 사용자의 최신 종합 발 분석(자세 균형, 좌우 압력 분포, "
-        "발볼/발길이 수치, 평균 습도), 무지외반 분석, 무좀 분석 결과를 조회하고, DB에 있는 전체 신발의 "
-        "리뷰와 비교해 신발별 발 적합도(fitScore)를 새로 계산합니다. 저장된 값을 불러오지 않고 매 요청마다 "
-        "다시 계산하며, 계산 결과는 리포트 서버의 신발 적합도 배치 저장 API로 전달됩니다. "
+        "측정 세션 ID와 Bearer 토큰을 Feetfit_Server 내부 조회 API에 전달하여 해당 완료 세션의 발 분석, "
+        "MUSINSA 리뷰, RunRepeat 원본 실측 context를 페이지 끝까지 조회합니다. 사용자 발 측정값과 RunRepeat "
+        "실측값의 TEMPORARY_HEURISTIC(NOT_CLINICALLY_VALIDATED) 정책으로 모든 신발의 fitScore와 "
+        "FOREFOOT/HEEL/INSOLE risk를 계산하고, BGE-M3로 해당 신발의 MUSINSA 리뷰만 선별합니다. "
+        "계산 결과는 pointSummary/reviewSummary가 null인 생성 대기 상태로 배치 저장 API에 "
+        "전달됩니다. 내부 조회 실패 시 shared DB로 우회하지 않습니다. "
         "상단 Authorize 버튼에서 Bearer 토큰을 먼저 입력하세요."
     ),
     responses={
         200: {"description": "리포트 서버에서 반환한 응답입니다."},
         404: {"description": "측정 세션 또는 발 분석 데이터를 찾을 수 없습니다."},
+        409: {"description": "다른 신발 추천 배치가 BGE-M3 런타임을 사용 중입니다."},
+        422: {"description": "완료 세션 입력 또는 RunRepeat 정량 데이터가 불충분합니다."},
         500: {"description": "AI 계산 중 오류가 발생했습니다."},
         502: {"description": "리포트 서버 요청에 실패했습니다."},
     },
@@ -560,13 +609,35 @@ async def create_integrated_foot_report(
 async def create_shoe_recommendations_report(
     request: ShoeRecommendationTriggerRequest,
     credentials: HTTPAuthorizationCredentials = Security(bearer_scheme),
+    _internal_api_key: None = Security(require_internal_api_key),
 ) -> Response:
+    authorization_header = f"{credentials.scheme} {credentials.credentials}"
     try:
-        batch = await run_in_threadpool(compute_shoe_recommendations, request.measurement_session_id)
+        server_client = ShoeServerClient(authorization_header)
+        context = await server_client.fetch_recommendation_context(request.measurement_session_id)
+    except ShoeServerConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+    except ShoeServerClientError as exc:
+        upstream_status = exc.status_code
+        if upstream_status is not None and 400 <= upstream_status < 500:
+            raise HTTPException(status_code=upstream_status, detail=str(exc)) from exc
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    try:
+        batch = await run_in_threadpool(compute_shoe_recommendations, context)
+    except ShoeRecommendationBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
     except ShoeRecommendationError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except ShoeDbError as exc:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
     forward_request = ShoeRecommendationForwardRequest(
         measurement_session_id=batch.measurement_session_id,
@@ -587,22 +658,12 @@ async def create_shoe_recommendations_report(
             for item in batch.items
         ],
     )
-    headers = {
-        "accept": "*/*",
-        "Authorization": f"{credentials.scheme} {credentials.credentials}",
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=settings.report_proxy_timeout_seconds) as client:
-            upstream_response = await client.post(
-                settings.shoe_recommendation_endpoint,
-                headers=headers,
-                json=forward_request.model_dump(by_alias=True),
-            )
-    except httpx.HTTPError as exc:
+        upstream_response = await server_client.forward_recommendations(forward_request)
+    except ShoeServerClientError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Report server request failed: {exc}",
+            detail=str(exc),
         ) from exc
 
     return Response(

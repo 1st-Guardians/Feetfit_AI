@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.schemas.reports import FootTypeAnalysisContext
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,21 @@ class TineaReportText:
     fungal_suspicion_safety_description: str
     skin_reaction_safety_description: str
     total_score_description: str
+
+
+@dataclass(frozen=True)
+class FootTypeEvidence:
+    evidence_id: str
+    category: str
+    canonical_fact: str
+    type_text: str
+
+
+@dataclass(frozen=True)
+class FootTypeReportText:
+    type_text: str
+    evidence_id: str
+    source: str
 
 
 def _compact_text(value: Any, fallback: str, max_chars: int = 220) -> str:
@@ -83,6 +99,9 @@ async def _create_structured_response(
 
     request_body = {
         "model": settings.openai_report_model,
+        # Foot-analysis inputs may be sensitive.  Responses used for report
+        # copy are not retained by OpenAI when this request-level flag is set.
+        "store": False,
         "input": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
@@ -115,6 +134,239 @@ async def _create_structured_response(
         raise RuntimeError(f"OpenAI response was incomplete: {reason}")
 
     return json.loads(_extract_response_text(data))
+
+
+_ARCH_EVIDENCE = {
+    "LOW": FootTypeEvidence(
+        evidence_id="ARCH_LOW",
+        category="ARCH",
+        canonical_fact="분석 결과에서 발 아치가 낮은 유형으로 분류됨",
+        type_text=(
+            "발의 아치가 낮아 발바닥이 넓게 닿는 편이에요. "
+            "오래 걷거나 서 있으면 피로가 커질 수 있어 아치를 잘 받쳐주는 신발이 더 편안할 수 있어요."
+        ),
+    ),
+    "NORMAL": FootTypeEvidence(
+        evidence_id="ARCH_NORMAL",
+        category="ARCH",
+        canonical_fact="분석 결과에서 발 아치가 보통 유형으로 분류됨",
+        type_text=(
+            "발의 아치와 발바닥 접촉이 비교적 균형적인 편이에요. "
+            "발을 고르게 받쳐주고 전체적으로 편안하게 맞는 신발이 잘 맞을 수 있어요."
+        ),
+    ),
+    "HIGH": FootTypeEvidence(
+        evidence_id="ARCH_HIGH",
+        category="ARCH",
+        canonical_fact="분석 결과에서 발 아치가 높은 유형으로 분류됨",
+        type_text=(
+            "발의 아치가 높은 편이라 발바닥의 일부 부위에 압력이 집중될 수 있어요. "
+            "충격을 부드럽게 분산하고 쿠션이 안정적인 신발이 더 편안할 수 있어요."
+        ),
+    ),
+}
+
+_WIDTH_EVIDENCE = {
+    "NARROW": FootTypeEvidence(
+        evidence_id="WIDTH_NARROW",
+        category="WIDTH",
+        canonical_fact="분석 결과에서 발볼이 좁은 유형으로 분류됨",
+        type_text=(
+            "발볼이 슬림한 편이라 너비가 넉넉한 신발에서는 발이 안에서 움직일 수 있어요. "
+            "발볼을 안정적으로 잡아주는 신발이 더 잘 맞을 수 있어요."
+        ),
+    ),
+    "NORMAL": FootTypeEvidence(
+        evidence_id="WIDTH_NORMAL",
+        category="WIDTH",
+        canonical_fact="분석 결과에서 발볼이 보통 유형으로 분류됨",
+        type_text=(
+            "발볼 너비가 비교적 균형적인 편이에요. "
+            "발길이와 발볼이 자연스럽게 맞고 발을 안정적으로 받쳐주는 신발이 편안할 수 있어요."
+        ),
+    ),
+    "WIDE": FootTypeEvidence(
+        evidence_id="WIDTH_WIDE",
+        category="WIDTH",
+        canonical_fact="분석 결과에서 발볼이 넓은 유형으로 분류됨",
+        type_text=(
+            "발볼이 넓은 편이라 앞쪽이 타이트한 신발에서는 압박을 느낄 수 있어요. "
+            "발볼 공간이 여유로운 신발을 고르면 더 편안할 수 있어요."
+        ),
+    ),
+}
+
+_PRESSURE_EVIDENCE = {
+    "LEFT_DOMINANT": FootTypeEvidence(
+        evidence_id="PRESSURE_LEFT_DOMINANT",
+        category="PRESSURE_BALANCE",
+        canonical_fact="분석 결과에서 왼발 압력 비중이 더 높은 유형으로 분류됨",
+        type_text=(
+            "왼발에 압력이 조금 더 실리는 편이에요. "
+            "양쪽 발을 고르게 받쳐주고 뒤꿈치가 안정적인 신발이 편안할 수 있어요."
+        ),
+    ),
+    "BALANCED": FootTypeEvidence(
+        evidence_id="PRESSURE_BALANCED",
+        category="PRESSURE_BALANCE",
+        canonical_fact="분석 결과에서 양발 압력 분포가 균형 유형으로 분류됨",
+        type_text=(
+            "양쪽 발의 압력 분포가 비교적 균형적인 편이에요. "
+            "발바닥을 고르게 받쳐주는 신발이 편안함을 유지하는 데 도움이 될 수 있어요."
+        ),
+    ),
+    "RIGHT_DOMINANT": FootTypeEvidence(
+        evidence_id="PRESSURE_RIGHT_DOMINANT",
+        category="PRESSURE_BALANCE",
+        canonical_fact="분석 결과에서 오른발 압력 비중이 더 높은 유형으로 분류됨",
+        type_text=(
+            "오른발에 압력이 조금 더 실리는 편이에요. "
+            "양쪽 발을 고르게 받쳐주고 뒤꿈치가 안정적인 신발이 편안할 수 있어요."
+        ),
+    ),
+}
+
+_PLANTAR_PRESSURE_EVIDENCE = FootTypeEvidence(
+    evidence_id="PLANTAR_PRESSURE_PATTERN",
+    category="PLANTAR_PRESSURE",
+    canonical_fact="발바닥 분석 결과에서 부위별 압력 분포 차이가 확인됨",
+    type_text=(
+        "발바닥의 압력이 부위별로 다르게 분포하는 편이에요. "
+        "발바닥을 고르게 받쳐주고 압력을 분산해 주는 신발이 더 편안할 수 있어요."
+    ),
+)
+
+
+def _pressure_balance_type(context: FootTypeAnalysisContext) -> str:
+    if context.pressure_balance_type != "UNKNOWN":
+        return context.pressure_balance_type
+    if (
+        context.left_pressure_percent is None
+        or context.right_pressure_percent is None
+    ):
+        return "UNKNOWN"
+
+    difference = context.left_pressure_percent - context.right_pressure_percent
+    tolerance = settings.foot_type_pressure_balance_tolerance_percent
+    if abs(difference) <= tolerance:
+        return "BALANCED"
+    return "LEFT_DOMINANT" if difference > 0 else "RIGHT_DOMINANT"
+
+
+def foot_type_evidence(context: FootTypeAnalysisContext) -> list[FootTypeEvidence]:
+    """Return only evidence explicitly classified by the upstream analysis.
+
+    Raw foot dimensions are intentionally not interpreted here.  In
+    particular, width/length measurements must never be used to infer a low
+    arch, flat foot, or a categorical width without a validated classifier.
+    """
+
+    evidence: list[FootTypeEvidence] = []
+    if context.arch_type != "UNKNOWN":
+        evidence.append(_ARCH_EVIDENCE[context.arch_type])
+    if context.foot_width_type != "UNKNOWN":
+        evidence.append(_WIDTH_EVIDENCE[context.foot_width_type])
+    pressure_balance_type = _pressure_balance_type(context)
+    if pressure_balance_type != "UNKNOWN":
+        evidence.append(_PRESSURE_EVIDENCE[pressure_balance_type])
+    if context.plantar_footprint_analysis_text is not None:
+        evidence.append(_PLANTAR_PRESSURE_EVIDENCE)
+    return evidence
+
+
+def build_fallback_foot_type_text(
+    context: FootTypeAnalysisContext,
+) -> FootTypeReportText:
+    candidates = foot_type_evidence(context)
+    if not candidates:  # The request schema normally rejects this first.
+        raise ValueError("Foot type text requires at least one classified analysis result.")
+    selected = candidates[0]
+    return FootTypeReportText(
+        type_text=selected.type_text,
+        evidence_id=selected.evidence_id,
+        source="FALLBACK",
+    )
+
+
+async def generate_foot_type_text(
+    context: FootTypeAnalysisContext,
+) -> FootTypeReportText:
+    """Select one grounded shoe-list message and render audited Korean copy.
+
+    GPT only chooses among evidence IDs supplied by the completed analysis.
+    The final sentence is rendered from a vetted mapping so an API response
+    cannot introduce a diagnosis or an unsupported foot characteristic.
+    """
+
+    fallback = build_fallback_foot_type_text(context)
+    candidates = foot_type_evidence(context)
+    if not (
+        _openai_enabled()
+        and settings.openai_foot_type_text_enabled
+    ):
+        return fallback
+
+    candidate_ids = [candidate.evidence_id for candidate in candidates]
+    schema = {
+        "type": "object",
+        "properties": {
+            "selectedEvidenceId": {
+                "type": "string",
+                "enum": candidate_ids,
+            }
+        },
+        "required": ["selectedEvidenceId"],
+        "additionalProperties": False,
+    }
+    payload = {
+        "task": "신발 목록 상단에 표시할 가장 유용한 발 분석 근거 한 개 선택",
+        "rules": [
+            "후보에 없는 발 특성이나 의학적 진단을 추론하지 않는다.",
+            "신발 선택에 가장 직접적으로 도움이 되는 근거를 우선한다.",
+            "ARCH, WIDTH, PRESSURE_BALANCE가 모두 있다면 ARCH를 우선 검토한다.",
+            "문구가 '이번 측정에서는'으로 시작되지 않도록 한다.",
+            "반드시 candidateEvidence의 evidenceId 중 하나만 선택한다.",
+        ],
+        "candidateEvidence": [
+            {
+                "evidenceId": candidate.evidence_id,
+                "category": candidate.category,
+                "fact": candidate.canonical_fact,
+            }
+            for candidate in candidates
+        ],
+    }
+
+    try:
+        data = await _create_structured_response(
+            system_prompt=(
+                "너는 FeetFit의 신발 선택 보조 문구를 위한 근거 선택기다. "
+                "제공된 구조화 분석 근거 밖의 사실은 만들지 말고 JSON 스키마만 반환한다."
+            ),
+            user_payload=payload,
+            schema_name="foot_type_text_evidence_selection",
+            json_schema=schema,
+            images=None,
+            max_output_tokens=80,
+        )
+        selected_id = data.get("selectedEvidenceId")
+        selected = next(
+            candidate
+            for candidate in candidates
+            if candidate.evidence_id == selected_id
+        )
+    except Exception as exc:
+        logger.warning(
+            "GPT foot type evidence selection failed; using fallback. error=%s",
+            exc,
+        )
+        return fallback
+
+    return FootTypeReportText(
+        type_text=selected.type_text,
+        evidence_id=selected.evidence_id,
+        source="OPENAI",
+    )
 
 
 def _metrics(result: Any) -> dict:

@@ -1,4 +1,6 @@
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 DEFAULT_FUNGAL_SUSPICION_SAFETY_DESCRIPTION = (
@@ -47,3 +49,111 @@ class HalluxValgusReportRequest(BaseModel):
     left_toe_angle_degree: float = Field(alias="leftToeAngleDegree", ge=0)
     right_toe_angle_degree: float = Field(alias="rightToeAngleDegree", ge=0)
     score_analysis_text: str = Field(alias="scoreAnalysisText")
+
+
+class FootTypeAnalysisContext(BaseModel):
+    """Already-classified facts that may be shown above the shoe list.
+
+    Raw length/width measurements are retained as traceable context, but they
+    are never converted into an arch or width category inside Feetfit_AI.  A
+    categorical sentence is allowed only when the upstream analysis supplies
+    the corresponding enum explicitly.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    arch_type: Literal["LOW", "NORMAL", "HIGH", "UNKNOWN"] = Field(
+        default="UNKNOWN", alias="archType"
+    )
+    foot_width_type: Literal["NARROW", "NORMAL", "WIDE", "UNKNOWN"] = Field(
+        default="UNKNOWN", alias="footWidthType"
+    )
+    pressure_balance_type: Literal[
+        "LEFT_DOMINANT", "BALANCED", "RIGHT_DOMINANT", "UNKNOWN"
+    ] = Field(default="UNKNOWN", alias="pressureBalanceType")
+    measured_left_foot_size_mm: float | None = Field(
+        default=None, alias="measuredLeftFootSizeMm", ge=0
+    )
+    measured_right_foot_size_mm: float | None = Field(
+        default=None, alias="measuredRightFootSizeMm", ge=0
+    )
+    left_foot_width_mm: float | None = Field(
+        default=None, alias="leftFootWidthMm", ge=0
+    )
+    right_foot_width_mm: float | None = Field(
+        default=None, alias="rightFootWidthMm", ge=0
+    )
+    left_pressure_percent: float | None = Field(
+        default=None, alias="leftPressurePercent", ge=0, le=100
+    )
+    right_pressure_percent: float | None = Field(
+        default=None, alias="rightPressurePercent", ge=0, le=100
+    )
+    plantar_footprint_analysis_text: str | None = Field(
+        default=None, alias="plantarFootprintAnalysisText", max_length=1000
+    )
+
+    @field_validator("plantar_footprint_analysis_text")
+    @classmethod
+    def compact_plantar_analysis_text(cls, value: str | None) -> str | None:
+        compacted = " ".join((value or "").split())
+        return compacted or None
+
+    @model_validator(mode="after")
+    def require_classified_evidence(self):
+        has_classification = not all(
+            value == "UNKNOWN"
+            for value in (
+                self.arch_type,
+                self.foot_width_type,
+                self.pressure_balance_type,
+            )
+        )
+        has_left_pressure = self.left_pressure_percent is not None
+        has_right_pressure = self.right_pressure_percent is not None
+        if has_left_pressure != has_right_pressure:
+            raise ValueError(
+                "leftPressurePercent and rightPressurePercent must be supplied together."
+            )
+        has_pressure_pair = has_left_pressure and has_right_pressure
+        if has_pressure_pair:
+            total = self.left_pressure_percent + self.right_pressure_percent
+            if not 99.0 <= total <= 101.0:
+                raise ValueError("Foot pressure percentages must total approximately 100.")
+        if not (
+            has_classification
+            or has_pressure_pair
+            or self.plantar_footprint_analysis_text is not None
+        ):
+            raise ValueError(
+                "At least one classified foot-type analysis result is required."
+            )
+        return self
+
+
+class FootTypeTextGenerationRequest(BaseModel):
+    """Authoritative completed-session facts supplied by Feetfit_Server."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    measurement_session_id: int = Field(alias="measurementSessionId", ge=1)
+    measurement_status: Literal["COMPLETED"] = Field(alias="measurementStatus")
+    facts_hash: str = Field(alias="factsHash", pattern=r"^[0-9a-f]{64}$")
+    analysis: FootTypeAnalysisContext
+
+
+class FootTypeTextGenerationResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    measurement_session_id: int = Field(alias="measurementSessionId", ge=1)
+    facts_hash: str = Field(alias="factsHash", pattern=r"^[0-9a-f]{64}$")
+    type_text: str = Field(alias="typeText", min_length=1, max_length=500)
+    evidence_id: str = Field(alias="evidenceId", min_length=1, max_length=80)
+    source: Literal["OPENAI", "FALLBACK"]
+
+    @field_validator("type_text")
+    @classmethod
+    def reject_measurement_session_preface(cls, value: str) -> str:
+        if value.lstrip().startswith("이번 측정에서는"):
+            raise ValueError("typeText must not start with a measurement-session preface.")
+        return value
